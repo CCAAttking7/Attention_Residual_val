@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import logging as hf_logging
 from transformers import get_cosine_schedule_with_warmup
 from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 
 # 导入魔改层
 from modeling_attnres_llama import KimiLlamaDecoderLayer
@@ -72,18 +73,101 @@ def patch_model_with_kimi(model, config, accelerator):
 # ==========================================
 # 🧠 神经中枢劫持 (RoPE 维度对齐完全体)
 # ==========================================
+# def kimi_model_forward(
+#     self, input_ids=None, attention_mask=None, position_ids=None,
+#     past_key_values=None, inputs_embeds=None, use_cache=None,
+#     output_attentions=None, output_hidden_states=None,
+#     return_dict=None, cache_position=None, **kwargs
+# ):
+#     if inputs_embeds is None:
+#         inputs_embeds = self.embed_tokens(input_ids)
+
+#     batch_size, seq_len = inputs_embeds.shape[:2]
+#     device = inputs_embeds.device
+
+#     # ===== 关键修复：正确生成 position_ids =====
+#     if position_ids is None:
+#         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+#     # ===== 关键修复：正确生成 cache_position =====
+#     if cache_position is None:
+#         cache_position = torch.arange(seq_len, device=device)
+
+#     # ===== 关键修复：正确生成 4D causal attention mask =====
+#     # 这是你原版代码完全缺失的部分
+#     causal_mask = self._update_causal_mask(
+#         attention_mask, inputs_embeds, cache_position,
+#         past_key_values, output_attentions
+#     )
+
+#     # ===== RoPE =====
+#     cos, sin = self.rotary_emb(inputs_embeds, position_ids)
+#     if cos.shape[-1] < self.layers[0].self_attn.head_dim:
+#         cos = torch.cat([cos, cos], dim=-1)
+#         sin = torch.cat([sin, sin], dim=-1)
+
+#     position_embeddings = (cos, sin)
+#     hidden_states = inputs_embeds
+#     history_cache = []
+#     block_size = 4
+
+#     for i, layer_module in enumerate(self.layers):
+#         current_history = list(history_cache) if history_cache else None
+
+#         if self.gradient_checkpointing and self.training:
+#             # gradient checkpointing 兼容写法
+#             def create_custom_forward(module):
+#                 def custom_forward(h_states, hist, pos_emb, attn_msk, p_ids):
+#                     return module(
+#                         h_states, history=hist,
+#                         position_embeddings=pos_emb,
+#                         attention_mask=attn_msk,
+#                         position_ids=p_ids,
+#                         use_cache=False
+#                     )
+#                 return custom_forward
+
+#             layer_outputs = self._gradient_checkpointing_func(
+#                 create_custom_forward(layer_module),
+#                 hidden_states, current_history,
+#                 position_embeddings, causal_mask, position_ids
+#             )
+#         else:
+#             layer_outputs = layer_module(
+#                 hidden_states,
+#                 attention_mask=causal_mask,  # 用处理过的 causal_mask
+#                 position_ids=position_ids,
+#                 history=current_history,
+#                 position_embeddings=position_embeddings,
+#                 use_cache=False
+#             )
+
+#         hidden_states = layer_outputs[0]
+#         # detach 是必要的（显存），但配合门控机制，
+#         # AttnRes 模块自身的参数仍然能通过当前 block 内的梯度学习
+#         if (i + 1) % block_size == 0:
+#             history_cache.append(hidden_states.detach())
+#     hidden_states = self.norm(hidden_states)
+#     return BaseModelOutputWithPast(last_hidden_state=hidden_states)
+# ==========================================
+# 🧠 神经中枢劫持 (完美门控 + 原生 SDPA 遮罩)
+# ==========================================
 def kimi_model_forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None, inputs_embeds=None, use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, cache_position=None, **kwargs):
     if inputs_embeds is None:
         inputs_embeds = self.embed_tokens(input_ids)
 
-    # 1. 计算 RoPE 并在外部算好 cos, sin
+    batch_size, seq_len = inputs_embeds.shape[:2]
+    device = inputs_embeds.device
+
+    # 1. 确保 position_ids 存在
+    if position_ids is None:
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+    # 2. 计算 RoPE 并对齐 64 维
     cos, sin = self.rotary_emb(inputs_embeds, position_ids)
-    
-    # 🌟 强行补齐 64 维：如果 RoPE 库只算了 32 维，我们就拼接两份
     if cos.shape[-1] < self.layers[0].self_attn.head_dim:
         cos = torch.cat([cos, cos], dim=-1)
         sin = torch.cat([sin, sin], dim=-1)
-    
     position_embeddings = (cos, sin)
 
     hidden_states = inputs_embeds
@@ -91,12 +175,12 @@ def kimi_model_forward(self, input_ids=None, attention_mask=None, position_ids=N
     block_size = 4 
 
     for i, layer_module in enumerate(self.layers):
+        # ⚠️ 必须用 list() 浅拷贝，防止梯度检查点报错
         current_history = list(history_cache) if len(history_cache) > 0 else None
         
         if self.gradient_checkpointing and self.training:
             def create_custom_forward(module):
                 def custom_forward(h_states, hist, pos_emb, attn_msk, p_ids):
-                    # 通过位置参数显式传递 position_embeddings
                     return module(h_states, history=hist, position_embeddings=pos_emb, 
                                   attention_mask=attn_msk, position_ids=p_ids, use_cache=False)
                 return custom_forward
@@ -106,13 +190,13 @@ def kimi_model_forward(self, input_ids=None, attention_mask=None, position_ids=N
                 hidden_states,
                 current_history,
                 position_embeddings,
-                attention_mask,
+                attention_mask, # ✨ 直接传 None，让 PyTorch SDPA 自动处理 Causal Mask
                 position_ids
             )
         else:
             layer_outputs = layer_module(
                 hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=attention_mask, # ✨ 直接传 None
                 position_ids=position_ids,
                 history=current_history,
                 position_embeddings=position_embeddings,
@@ -120,6 +204,7 @@ def kimi_model_forward(self, input_ids=None, attention_mask=None, position_ids=N
             )
             
         hidden_states = layer_outputs[0]
+
         if (i + 1) % block_size == 0:
             history_cache.append(hidden_states.detach())
 
@@ -172,9 +257,7 @@ def main():
         input_ids = batch["input_ids"]
         device = input_ids.device
         seq_len = input_ids.shape[1]
-        position_ids = torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0).view(-1, seq_len)
-        batch["position_ids"] = position_ids
-
+        
         with accelerator.accumulate(model):
             outputs = model(**batch)
             loss = outputs.loss

@@ -4,6 +4,7 @@ import torch.nn as nn
 from transformers.cache_utils import Cache
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMSNorm
 from typing import Optional, Tuple, List, Any
+#核心思路：让 AttnRes 在训练初期表现为恒等映射（identity），然后逐渐学习融合历史信息
 
 #对历史block的输出进行残差融合
 class BlockAttnRes(nn.Module):
@@ -13,6 +14,9 @@ class BlockAttnRes(nn.Module):
         #伪Query，全零初始化保证初期softmax后权重均匀分布，不会过早偏向某个历史block
         self.w_l = nn.Parameter(torch.zeros(hidden_size)) 
         self.norm = LlamaRMSNorm(hidden_size) #每个block都要做RMSNorm归一化，保证打分时不同block的状态在同一尺度上，避免某个block因为数值较大而占主导地位。注意这里的RMSNorm是LlamaRMSNorm，和LlamaDecoderLayer中使用的norm保持一致。
+        # 门控标量，初始化为 0，sigmoid(0)=0.5，
+        # 但配合下面的逻辑，初始时 fused 权重极小
+        self.gate = nn.Parameter(torch.tensor(-5.0))  # sigmoid(-5) ≈ 0.007
 
     def forward(self, history_states,current_state):
         #如果是第一层，返回当前状态
@@ -37,8 +41,9 @@ class BlockAttnRes(nn.Module):
 
         # 5.加权求和，得到融合后的状态，维度(batch_size, seq_len, hidden_size)
         fused_state = torch.einsum('nbsd,nbs->bsd', all_states, alphas)
+        g = torch.sigmoid(self.gate)
 
-        return fused_state
+        return (1 - g) * current_state + g * fused_state
 
 #继承原版LlamaDecoderLayer，并“强行”缝入两个 BlockAttnRes (Attention前 和 MLP前)
 class KimiLlamaDecoderLayer(LlamaDecoderLayer):
@@ -56,7 +61,8 @@ class KimiLlamaDecoderLayer(LlamaDecoderLayer):
         output_attentions: bool = False,
         use_cache: bool = False,
         history: Optional[List[torch.Tensor]] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # 🌟 补齐参数
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+        **kwargs,  # 吸收额外参数，避免签名不匹配
     ) -> Tuple[torch.Tensor]:
         """NOTE
         =========================================================================================
