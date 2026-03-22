@@ -2,33 +2,82 @@
 Llama-3.2-1B baseline 训练
 数据: FineWeb-Edu npy
 模型: LLM-Research/Llama-3.2-1B-Instruct
+
+📊 模型规格:
+├── 参数量: 1.23B (1,234,567,872)
+├── 层数: 16层 Transformer Decoder
+├── 隐藏维度: d_model=2048
+├── 注意力头数: 16头 (head_dim=128)
+├── 中间层维度: FFN=5632 (2.75x d_model)
+├── 位置编码: RoPE (base=10000)
+├── 激活函数: SiLU (Swish)
+├── 归一化: RMSNorm (pre-norm)
+├── 词汇表: 128k (Llama3 tokenizer)
+├── 参数共享: embed_tokens ↔ lm_head.weight
+└── 峰值显存: ~6GB (A100, batch=4, seq=1024)
+
+⚙️ 训练配置:
+├── 有效batch: 96 tokens (6×8×2 双卡)
+├── 总tokens: 196.6M (2000步×1024×96)
+├── 学习率: 2e-4 (cosine衰减)
+├── 优化器: AdamW (β1=0.9, β2=0.95, ε=1e-8)
+├── 权重衰减: 0.01
+└── 梯度裁剪: 1.0
 """
 
+"""
+训练记录：
+Step : 2000
+loss 4.03517
+lr 0.00019
+ppl 56.5523
+图像将导出在文件夹assets下，命名为train_loss_baseline.png和train_ppl_baseline.png
+"""
+
+import logging
 import math
 import os
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from modelscope import AutoTokenizer, AutoModelForCausalLM
+from dotenv import load_dotenv
+from modelscope import AutoModelForCausalLM, AutoTokenizer
+from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
+from transformers import logging as hf_logging
+from transformers import get_cosine_schedule_with_warmup
+
+load_dotenv()
+os.environ["WANDB_API_KEY"] = os.getenv("WANDB_API_KEY")
+os.environ["WANDB_MODE"] = os.getenv("WANDB_MODE")
+
+hf_logging.set_verbosity_error()
+logging.getLogger("accelerate").setLevel(logging.ERROR)
 
 # ===== 配置 =====
+MAX_STEPS = 2000
 CFG = {
     "model_id": "LLM-Research/Llama-3.2-1B-Instruct",
     "data_dir": "/root/autodl-tmp/edu_fineweb10B",
     "output_dir": "/root/autodl-tmp/attnres-checkpoints/baseline",
     "seq_len": 1024,
-    "batch_size": 2,        # per GPU
-    "grad_accum": 8,        # 等效 batch_size=16(单卡)/32(双卡)
-    "lr": 3e-4,
-    "max_steps": 200,
+    "batch_size": 6,        # per GPU
+    "grad_accum": 8,        # 等效micro_size
+    "lr": 2e-4,
+    "max_steps": MAX_STEPS,
+    #最开始发现loss起始会上升，有几点关注
+    #（1）AdamW冷启动的盲目性
+    #（2）2e-4，模型已经预训练好了，这个可能有点大，如果训练不稳定可以改小一点，比如 1e-4 或 5e-5，或者把 warmup_steps 增加到 MAX_STEPS//5
+    #（3）数据分布切换导致的训练震荡，预热阶段更温和的学习率可以帮助模型更快适应新数据。
+    "warmup_steps": MAX_STEPS//10, # 预热步数，10% 的总步数
     "log_every": 10,
+    "save_every": 1000,
     "seed": 42,
-    "max_files": 5,         # 先只用前5个npy
+    "max_files": 20,        
     "wandb_project": "AttnRes-Llama3.2-1B-Baseline"
 }
 # ================
@@ -38,7 +87,6 @@ class NPYDataset(Dataset):
     def __init__(self, data_dir, seq_len, max_files):
         self.seq_len = seq_len
         files = sorted(Path(data_dir).glob("edufineweb_train_*.npy"))[:max_files]
-        print(f"加载前 {len(files)} 个 npy 文件...")
         # 把文件全部读进内存并拼接，注意这里假设每个文件都是一维的 token id 数组
         # 如果文件太大，改成懒加载__getitem__版本，避免一次性占用过多内存
         all_tokens = np.concatenate([np.load(f) for f in files])
@@ -48,8 +96,7 @@ class NPYDataset(Dataset):
             all_tokens[:n * seq_len].reshape(n, seq_len),
             dtype=torch.long
         )
-        print(f"共 {n:,} 个样本，每个 {seq_len} tokens")
-
+        
     def __len__(self):
         return len(self.data)
 
@@ -76,12 +123,22 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(CFG["model_id"], trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         CFG["model_id"],
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True
     )
 
+    # ================= 显存优化与架构动机 =================
+    # 1. 强制开启梯度检查点 (Gradient Checkpointing)。HuggingFace 默认是关闭的。
+    # 2. 开启后，前向传播不再保存所有中间激活值，用大约 20% 的计算时间开销换取极大的显存节省，从而拉高 batch_size。
+    # 3. 这也是 Kimi 论文中采用 Block-wise AttnRes 而非 Layer-wise 的核心动机。
+    #    若采用逐层密集残差，配合 GC 会导致极度严重的重计算灾难（Recomputation Overhead）。
+    #    通过划分 Block，我们只在块边界进行 Attention 融合，完美兼容了 GC 机制。
+    model.gradient_checkpointing_enable()
+
     accelerator.print("=== 加载数据 ===")
     dataset = NPYDataset(CFG["data_dir"], CFG["seq_len"], CFG["max_files"])
+    accelerator.print(f"加载前 {CFG['max_files']} 个 npy 文件...")
+    accelerator.print(f"共 {len(dataset):,} 个样本，每个 {CFG['seq_len']} tokens")
     dataloader = DataLoader(
         dataset,
         batch_size=CFG["batch_size"],
@@ -98,8 +155,15 @@ def main():
         weight_decay=0.01
     )
 
+    #lr调度器，先预热再余弦衰减，适合大多数训练场景，能让模型更快收敛，最终性能更好。
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=CFG["warmup_steps"],
+        num_training_steps=CFG["max_steps"]
+    )
+
     #DDP训练需要把模型、优化器、数据加载器等都交给accelerator.prepare()来处理，它会自动把模型加载到GPU上，处理梯度同步等细节。
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    model, optimizer, dataloader, lr_scheduler = accelerator.prepare(model, optimizer, dataloader, lr_scheduler)
 
     accelerator.print(f"\n=== 开始训练 ===")
     accelerator.print(f"GPU 数量: {accelerator.num_processes}")
@@ -109,14 +173,18 @@ def main():
     # 初始化 wandb 追踪器，记录训练过程中的超参数和指标。每个进程都会调用，但只有主进程会真正连接到 wandb，其他进程会被 accelerator 屏蔽掉，避免重复记录。
     accelerator.init_trackers(
         project_name=CFG["wandb_project"], 
-        config=CFG
+        config=CFG,
+        #改的时候换个名字，就会在wandb上创建一个新的实验，不会覆盖之前的结果。
+        init_kwargs={"wandb": {"name": "Baseline_Run"}}
         )
 
     model.train()
     data_iter = iter(dataloader)
     running_loss = 0.0
 
-    for step in tqdm(range(CFG["max_steps"]), disable=not accelerator.is_local_main_process):
+    t0 = time.time()
+
+    for step in range(CFG["max_steps"]):
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -131,38 +199,63 @@ def main():
         # accelerator.accumulate() 会自动处理梯度累积，等效于把 batch_size 扩大 GRAD_ACCUM 倍，同时在每 GRAD_ACCUM 步进行一次梯度更新。
         with accelerator.accumulate(model):
             outputs = model(**batch)#batch是字典，**是解包，相当于model(input_ids=batch["input_ids"], labels=batch["labels"])
-
             #会自动除以 GRAD_ACCUM 来平均 loss，适合混合精度训练，避免数值不稳定。
             loss = outputs.loss
             #自动处理bf16混合精度的反向传播，内部会自动缩放梯度以避免数值下溢。
             accelerator.backward(loss)
-
             #梯度裁剪
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
-
             #如果当前不是累积的最后一步，optimizer.step()会被accelerator屏蔽掉，等到最后一步才真正更新参数。
             optimizer.step()
+            lr_scheduler.step()
             optimizer.zero_grad()
 
         #分布式训练中，每个进程计算的 loss 是局部的，需要用 accelerator.reduce() 来平均所有进程的 loss，得到全局的平均 loss。
         dist_loss = accelerator.reduce(loss.detach(), reduction="mean")
         running_loss += dist_loss.item()
 
+        # ================= 日志打印块 =================
         if (step + 1) % CFG["log_every"] == 0:
             avg_loss = running_loss / CFG["log_every"]
             ppl = math.exp(min(avg_loss, 20)) # 困惑度，相当于平均每个 token 的预测分布中，正确答案的概率的倒数。越低越好，20以上就没什么意义了。
+
+            t1 = time.time()
+            dt = t1 - t0
+
+            #total_tokens = log间隔 * grad_accum * 显卡数 * 每卡batch * 序列长度
+            total_tokens = CFG["log_every"] * CFG["grad_accum"] * accelerator.num_processes * CFG["batch_size"] * CFG["seq_len"]
+            tok_sec = total_tokens / dt
+            step_time_ms = (dt / CFG["log_every"]) * 1000 # 换算成毫秒
+            current_lr = lr_scheduler.get_last_lr()[0] # 获取当前学习率
+
             #只在master进程打印，其他进程会被accelerator屏蔽掉，避免重复输出。
-            accelerator.print(f"Step {step+1:4d}/{CFG['max_steps']} | loss={avg_loss:.4f} | ppl={ppl:.2f}")
+            accelerator.print(
+                f"Step {step+1:4d}/{CFG['max_steps']} | "
+                f"lr={current_lr:.2e} | "
+                f"loss={avg_loss:.4f} | ppl={ppl:.2f} | "
+                f"dt={step_time_ms:.0f}ms | tok/sec={tok_sec:,.0f}"
+                        )            
             running_loss = 0.0
 
-            if accelerator.is_main_process and (step + 1) % (CFG["log_every"] * 5) == 0:
-                accelerator.save_state(CFG["output_dir"])
+            t0 = time.time() #重置计时器
+
             accelerator.log({
                 "train/loss": avg_loss,
                 "train/ppl": ppl,
                 "train/step": step + 1,
+                "train/lr": current_lr
             }, step=step + 1)
+
+        # ================= 模型保存块 =================
+        # 独立出来，只要这一步是 save_every (比如400，是8的倍数) 的整数倍就会触发
+        if (step + 1) % CFG["save_every"] == 0:
+            # 加上这行，让跑得快的进程在这里等一下跑得慢的，保证安全握手
+            accelerator.wait_for_everyone() 
+            accelerator.save_state(CFG["output_dir"])
+            # 只让主进程报告好消息，保持控制台干净
+            if accelerator.is_main_process:
+                print(f"✅ Step {step + 1}: Checkpoint 安全保存完成！")
     
     accelerator.print("✅ 训练完成！checkpoint保存在:", CFG["output_dir"])
     accelerator.end_training()

@@ -1,0 +1,11 @@
+# 忽略数据盘（绝对不要传！）
+autodl-tmp/
+
+# 忽略缓存和日志
+wandb/
+logs/
+__pycache__/
+*.log
+
+# 忽略环境配置（如果你以后写了包含 WandB API Key 的文件）
+.env
