@@ -1,7 +1,9 @@
 #这里写AttnRes的部件，主要是为了在LlamaDecoderLayer中替换原有的残差连接为AttnRes。
 import torch
 import torch.nn as nn
+from transformers.cache_utils import Cache
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMSNorm
+from typing import Optional, Tuple, List, Any
 
 #对历史block的输出进行残差融合
 class BlockAttnRes(nn.Module):
@@ -45,7 +47,17 @@ class KimiLlamaDecoderLayer(LlamaDecoderLayer):
         self.attn_fusion = BlockAttnRes(config.hidden_size)
         self.mlp_fusion = BlockAttnRes(config.hidden_size)
 
-    def forward(self, hidden_states, history = None, **kwargs):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        history: Optional[List[torch.Tensor]] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # 🌟 补齐参数
+    ) -> Tuple[torch.Tensor]:
         """NOTE
         =========================================================================================
         🚀 Kimi 架构与 Llama 微调的融合设计说明 
@@ -67,21 +79,35 @@ class KimiLlamaDecoderLayer(LlamaDecoderLayer):
         结论：这样既安全地继承了 Llama 强大的预训练知识，又极其平稳地植入了 Kimi 的长上下文跨层记忆科技！
         =========================================================================================
         """
-        ## Kimi 科技：拿历史记录和当前主干道融合，得到一个拥有全局视野的“参考特征”
-        h_fused_attn = self.attn_fusion(history,hidden_states)
+        residual = hidden_states
 
-        #走原版的 Norm 和 Attention (注意这里喂进去的是融合后的 h_fused_attn)
+        # Kimi 融合：Attention 前融合历史
+        h_fused_attn = self.attn_fusion(history or [], hidden_states)
+
         h = self.input_layernorm(h_fused_attn)
-        attn_outputs = self.self_attn(hidden_states=h, **kwargs)
-        attn_out = attn_outputs[0]#LlamaSelfAttention的输出是一个tuple，第一个元素是attn_out，第二个元素是attn_weights（如果需要的话）。我们只需要attn_out。
 
-        # Attention 算出的增量，必须老老实实加回最原始的 hidden_states！
-        mid_state = hidden_states + attn_out
+        # 调用 Attention，显式传递补齐后的 position_embeddings
+        attn_outputs = self.self_attn(
+            hidden_states=h,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings, # 🌟 关键传递
+        )
+        attn_output = attn_outputs[0]
 
-        #MLP子层
-        h_fused_mlp = self.mlp_fusion(history,mid_state)
+        # 加回原始残差（Llama 风格）
+        mid_state = residual + attn_output
+
+        # MLP 前再融合一次
+        h_fused_mlp = self.mlp_fusion(history or [], mid_state)
+
         h = self.post_attention_layernorm(h_fused_mlp)
-        mlp_out = self.mlp(h)
+        mlp_output = self.mlp(h)
 
-        # MLP 的增量，老老实实加回主干道
-        return mid_state + mlp_out
+        # 加回残差
+        output = mid_state + mlp_output
+
+        return (output,)
