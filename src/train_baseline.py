@@ -31,7 +31,7 @@ Step : 2000
 loss 4.03517
 lr 0.00019
 ppl 56.5523
-图像将导出在文件夹assets下，命名为train_loss_baseline.png和train_ppl_baseline.png
+图像将导出在文件夹assets下
 """
 
 import logging
