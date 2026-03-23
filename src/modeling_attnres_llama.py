@@ -26,10 +26,11 @@ class BlockAttnRes(nn.Module):
         # 门控标量，初始化为 0，sigmoid(0)=0.5，
         # 但配合下面的逻辑，初始时 fused 权重极小
         # 后面可以改大一点试一试，或者干脆直接固定一个小值（比如0.01），让模型专注于利用历史信息，看看效果如何。
-        self.gate = nn.Parameter(torch.tensor(-5.0))  # sigmoid(-5) ≈ 0.007
+        self.gate = nn.Parameter(torch.tensor(-2.0))  # sigmoid(-2.0) ≈ 0.119
 
     def forward(self, history_states, current_state):
         # 如果是第一层，返回当前状态
+        # 这里的限制导致layer0的门控不会被触发，因为它没有历史状态可融合，这样可以保证第一层的输入完全来自原始的当前状态，不受AttnRes的影响，安全地继承Llama的预训练知识。
         if not history_states:
             return current_state
 

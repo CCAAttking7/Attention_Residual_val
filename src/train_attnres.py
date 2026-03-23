@@ -21,9 +21,25 @@ from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 # 导入魔改层
 from modeling_attnres_llama import KimiLlamaDecoderLayer
 
-# step:2000,gate:-5.0,lr:2e-4(linear-Cosine)
+# 实验记录
+# (1)V1发现门控没有作用/但仍然比baseline好，说明AttnRes的历史融合确实在起作用，但门控参数可能需要调整
+# step:2000 gate:-5.0(0.0067) lr:2e-4(linear-Cosine) 门控/打分权重bf16 全局学习率
 # loss:3.98106
 # ppl:53.57398
+
+# (2)V2
+# step:2000 gate:-2.0(0.1192) lr:2e-4(linear-Cosine) 门控/打分权重float32 全局学习率
+# gates/layer_0_attn_prob 0.1192
+# gates/layer_0_mlp_prob 0.1192
+# gates/layer_8_attn_prob 0.11877
+# gates/layer_8_mlp_prob 0.118
+# gates/layer_15_attn_prob 0.12057
+# gates/layer_15_mlp_prob 0.11887
+# train/loss 3.99995
+# train/ppl 54.59554
+
+#(3)V3
+# step:2000 gate:-2.0(0.1192) lr:2e-4(linear-Cosine) 门控/打分权重float32 gate50倍全局学习率
 
 load_dotenv()
 os.environ["WANDB_API_KEY"] = os.getenv("WANDB_API_KEY")
@@ -75,8 +91,15 @@ def patch_model_with_kimi(model, config, accelerator):
     for i in range(len(model.model.layers)):
         old_layer = model.model.layers[i]
         new_layer = KimiLlamaDecoderLayer(config, layer_idx=i)
+        # 1. 这一步把整个新层变成了 bfloat16
         new_layer.to(old_layer.input_layernorm.weight.dtype)
         new_layer.load_state_dict(old_layer.state_dict(), strict=False)
+        
+        # 🌟 2. 【问题四】：把门控和打分权重强制提权回 float32，因为bf16会为了了节省显存而把小权重压成0，导致门控失效和权重失效。我们需要让它们保持在float32的精度上，才能正常学习到微妙的权重调整。
+        new_layer.attn_fusion.gate.data = new_layer.attn_fusion.gate.data.float()
+        new_layer.mlp_fusion.gate.data = new_layer.mlp_fusion.gate.data.float()
+        new_layer.attn_fusion.w_l.data = new_layer.attn_fusion.w_l.data.float()
+        new_layer.mlp_fusion.w_l.data = new_layer.mlp_fusion.w_l.data.float()
         model.model.layers[i] = new_layer
     accelerator.print("✅ 手术圆满完成！")
     return model
@@ -210,7 +233,27 @@ def main():
         pin_memory=True,
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=0.01)
+    #optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=0.01)
+
+    #这里我们认为，模型中除了门控和打分权重以外的其他参数（比如原有的线性层权重、RMSNorm权重等）都已经在预训练中学到了比较好的表示，我们不希望它们在微调过程中发生太大的变化，所以保持较低的学习率；而新加的门控参数和打分权重一开始是随机初始化的，需要快速学习到合理的值，所以给它们一个较高的学习率，这样可以让模型更快地适应新的融合机制，提高训练效率。
+    # 🌟 === 新写法：为新增参数分组提速 ===
+    custom_params = []
+    base_params = []
+    for name, param in model.named_parameters():
+        if "fusion" in name:  # 自动匹配我们新加的 attn_fusion 和 mlp_fusion 模块
+            custom_params.append(param)
+        else:
+            base_params.append(param)
+
+    # 基础模型用 2e-4，新加的器官用 1e-2 (提速 50 倍)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": base_params, "lr": CFG["lr"]},
+            {"params": custom_params, "lr": CFG["lr"] * 50} 
+        ],
+        weight_decay=0.01
+    )
+
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=CFG["warmup_steps"],
@@ -223,7 +266,7 @@ def main():
     accelerator.init_trackers(
         project_name=CFG["wandb_project"],
         config=CFG,
-        init_kwargs={"wandb": {"name": "AttnRes_Run_v1"}},
+        init_kwargs={"wandb": {"name": "V3-AttnRes_Gate(-2)_50xLR" }},  # 🌟 给每次实验的 WandB run 起个名字，方便区分
     )
 
     model.train()
