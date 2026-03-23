@@ -273,23 +273,44 @@ def main():
             # 获取当前学习率
             current_lr = lr_scheduler.get_last_lr()[0]
 
+            # 获取门控值并记录
+            gate_stats = {}
+            raw_model = accelerator.unwrap_model(model)
+
+            # 抓取第0层(底层), 第8层(中层), 第15层(高层)的gate值
+            for i in [0, 8, 15]:
+                attn_gate = raw_model.model.layers[i].attn_fusion.gate.item()
+                mlp_gate = raw_model.model.layers[i].mlp_fusion.gate.item()
+
+                # 算Sigmoid，转成真实的概率值记录下来
+                gate_stats[f"gates/layer_{i}_attn_prob"] = torch.sigmoid(
+                    torch.tensor(attn_gate)
+                ).item()
+                gate_stats[f"gates/layer_{i}_mlp_prob"] = torch.sigmoid(
+                    torch.tensor(mlp_gate)
+                ).item()
+
+            # 取中层(第8层)的 Attention 门控值在终端显示
+            mid_layer_gate = gate_stats["gates/layer_8_attn_prob"]
+
             accelerator.print(
                 f"Step {step + 1:4d}/{CFG['max_steps']} | "
                 f"lr={current_lr:.2e} | "
                 f"loss={avg_loss:.4f} | ppl={ppl:.2f} | "
+                f"Gate8={mid_layer_gate:.4f} | "
                 f"dt={step_time_ms:.0f}ms | tok/sec={tok_sec:,.0f}"
             )
 
             # 同步更新给 WandB
-            accelerator.log(
-                {
-                    "train/loss": avg_loss,
-                    "train/ppl": ppl,
-                    "train/step": step + 1,
-                    "train/lr": current_lr,
-                },
-                step=step + 1,
-            )
+            log_data = {
+                "train/loss": avg_loss,
+                "train/ppl": ppl,
+                "train/step": step + 1,
+                "train/lr": current_lr,
+            }
+            log_data.update(gate_stats)  # 把门控统计数据也加入日志
+
+            accelerator.log(log_data, step=step + 1)
 
             # 重置累加器和计时器
             running_loss = 0.0
