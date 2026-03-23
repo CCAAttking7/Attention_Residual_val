@@ -38,8 +38,16 @@ from modeling_attnres_llama import KimiLlamaDecoderLayer
 # train/loss 3.99995
 # train/ppl 54.59554
 
-#(3)V3
+# (3)V3
 # step:2000 gate:-2.0(0.1192) lr:2e-4(linear-Cosine) 门控/打分权重float32 gate50倍全局学习率
+# gates/layer_0_attn_prob 0.1192
+# gates/layer_0_mlp_prob 0.1192
+# gates/layer_8_attn_prob 0.1228
+# gates/layer_8_mlp_prob 0.10664
+# gates/layer_15_attn_prob 0.15644
+# gates/layer_15_mlp_prob 0.13087
+# train/loss 3.98229
+# train/ppl 53.63991
 
 load_dotenv()
 os.environ["WANDB_API_KEY"] = os.getenv("WANDB_API_KEY")
@@ -94,7 +102,7 @@ def patch_model_with_kimi(model, config, accelerator):
         # 1. 这一步把整个新层变成了 bfloat16
         new_layer.to(old_layer.input_layernorm.weight.dtype)
         new_layer.load_state_dict(old_layer.state_dict(), strict=False)
-        
+
         # 🌟 2. 【问题四】：把门控和打分权重强制提权回 float32，因为bf16会为了了节省显存而把小权重压成0，导致门控失效和权重失效。我们需要让它们保持在float32的精度上，才能正常学习到微妙的权重调整。
         new_layer.attn_fusion.gate.data = new_layer.attn_fusion.gate.data.float()
         new_layer.mlp_fusion.gate.data = new_layer.mlp_fusion.gate.data.float()
@@ -233,9 +241,9 @@ def main():
         pin_memory=True,
     )
 
-    #optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=0.01)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=0.01)
 
-    #这里我们认为，模型中除了门控和打分权重以外的其他参数（比如原有的线性层权重、RMSNorm权重等）都已经在预训练中学到了比较好的表示，我们不希望它们在微调过程中发生太大的变化，所以保持较低的学习率；而新加的门控参数和打分权重一开始是随机初始化的，需要快速学习到合理的值，所以给它们一个较高的学习率，这样可以让模型更快地适应新的融合机制，提高训练效率。
+    # 这里我们认为，模型中除了门控和打分权重以外的其他参数（比如原有的线性层权重、RMSNorm权重等）都已经在预训练中学到了比较好的表示，我们不希望它们在微调过程中发生太大的变化，所以保持较低的学习率；而新加的门控参数和打分权重一开始是随机初始化的，需要快速学习到合理的值，所以给它们一个较高的学习率，这样可以让模型更快地适应新的融合机制，提高训练效率。
     # 🌟 === 新写法：为新增参数分组提速 ===
     custom_params = []
     base_params = []
@@ -249,9 +257,9 @@ def main():
     optimizer = torch.optim.AdamW(
         [
             {"params": base_params, "lr": CFG["lr"]},
-            {"params": custom_params, "lr": CFG["lr"] * 50} 
+            {"params": custom_params, "lr": CFG["lr"] * 50},
         ],
-        weight_decay=0.01
+        weight_decay=0.01,
     )
 
     lr_scheduler = get_cosine_schedule_with_warmup(
@@ -266,7 +274,9 @@ def main():
     accelerator.init_trackers(
         project_name=CFG["wandb_project"],
         config=CFG,
-        init_kwargs={"wandb": {"name": "V3-AttnRes_Gate(-2)_50xLR" }},  # 🌟 给每次实验的 WandB run 起个名字，方便区分
+        init_kwargs={
+            "wandb": {"name": "V3-AttnRes_Gate(-2)_50xLR"}
+        },  # 🌟 给每次实验的 WandB run 起个名字，方便区分
     )
 
     model.train()
